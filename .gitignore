@@ -1,0 +1,5 @@
+.idea
+hosts.txt
+speed
+compile.sh
+cp_to_server.sh
