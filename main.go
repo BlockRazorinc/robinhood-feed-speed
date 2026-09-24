@@ -40,6 +40,11 @@ type sourceEntry struct {
 	URL  string
 }
 
+const (
+	feedClientVersionHeader = "Arbitrum-Feed-Client-Version"
+	feedClientVersion       = "2"
+)
+
 type sourceListFlag []sourceEntry
 
 func (f *sourceListFlag) String() string {
@@ -379,7 +384,11 @@ func runWebsocketSource(ctx context.Context, tracker *Tracker, source sourceConf
 		}
 
 		log.Printf("[%s] connecting %s", source.Name, source.URL)
-		conn, _, err := websocket.DefaultDialer.Dial(source.URL, nil)
+		dialer := *websocket.DefaultDialer
+		dialer.EnableCompression = true
+		header := make(http.Header, 1)
+		header.Set(feedClientVersionHeader, feedClientVersion)
+		conn, _, err := dialer.Dial(source.URL, header)
 		if err != nil {
 			tracker.SetDisconnected(source.Name, err)
 			log.Printf("[%s] connect failed: %v", source.Name, err)
