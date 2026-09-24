@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"container/heap"
 	"context"
 	"encoding/json"
@@ -15,6 +16,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"text/tabwriter"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -231,6 +233,7 @@ func main() {
 		log.Printf("[metrics] shutdown error: %v", err)
 	}
 	wg.Wait()
+	printSummary(tracker.SummaryWithPercentiles(time.Now(), 0))
 	log.Printf("[speed-test] stopped")
 }
 
@@ -267,34 +270,54 @@ func runIncrementalSummaries(ctx context.Context, tracker *Tracker, interval tim
 }
 
 func printSummary(summary SummarySnapshot) {
-	log.Printf("[summary]\ttype\t%s\twindow\t%s\tcompleted_blocks\t%d",
-		summary.Type,
-		summary.Window,
-		summary.CompletedBlocks,
-	)
+	for _, line := range summaryLines(summary) {
+		log.Print(line)
+	}
+}
+
+func summaryLines(summary SummarySnapshot) []string {
+	var buf bytes.Buffer
+	writer := tabwriter.NewWriter(&buf, 0, 4, 2, ' ', 0)
+	fmt.Fprintln(writer, "source\tcount\twin_rate\tp50\tp90\tp95\tp99\tmax")
+	fmt.Fprintln(writer, "------\t------\t--------\t----\t----\t----\t----\t---")
 	for _, source := range summary.WinnerCounts {
-		if source.Percentiles == nil {
-			log.Printf("[summary]\ttype\t%s\tsource\t%s\twinner\t%d",
-				summary.Type,
-				source.Source,
-				source.Count,
-			)
+		rate := winRate(source.Count, summary.CompletedBlocks)
+		percentiles := source.Percentiles
+		if percentiles == nil {
+			fmt.Fprintf(writer, "%s\t%d\t%s\t-\t-\t-\t-\t-\n",
+				source.Source, summary.CompletedBlocks, rate)
 			continue
 		}
-		log.Printf("[summary]\ttype\t%s\tsource\t%s\twinner\t%d\tp10\t%s\tp50\t%s\tp75\t%s\tp90\t%s\tp95\t%s\tp99\t%s\tp99.9\t%s\tmax\t%s",
-			summary.Type,
+		fmt.Fprintf(writer, "%s\t%d\t%s\t%s\t%s\t%s\t%s\t%s\n",
 			source.Source,
-			source.Count,
-			source.Percentiles.P10,
-			source.Percentiles.P50,
-			source.Percentiles.P75,
-			source.Percentiles.P90,
-			source.Percentiles.P95,
-			source.Percentiles.P99,
-			source.Percentiles.P999,
-			source.Percentiles.Max,
+			summary.CompletedBlocks,
+			rate,
+			formatMillis(percentiles.P50),
+			formatMillis(percentiles.P90),
+			formatMillis(percentiles.P95),
+			formatMillis(percentiles.P99),
+			formatMillis(percentiles.Max),
 		)
 	}
+	if err := writer.Flush(); err != nil {
+		return []string{}
+	}
+	text := strings.TrimRight(buf.String(), "\n")
+	if text == "" {
+		return nil
+	}
+	return strings.Split(text, "\n")
+}
+
+func winRate(wins, completedBlocks uint64) string {
+	if completedBlocks == 0 {
+		return "0.00%"
+	}
+	return fmt.Sprintf("%.2f%%", float64(wins)/float64(completedBlocks)*100)
+}
+
+func formatMillis(value time.Duration) string {
+	return fmt.Sprintf("%.3fms", float64(value)/float64(time.Millisecond))
 }
 
 func buildSources(
@@ -503,10 +526,46 @@ func extractBlocks(data []byte) ([]blockInfo, error) {
 }
 
 func blockOutputHeader(sourceNames []string) string {
-	columns := []string{"[block]", "sequence_number", "block_hash"}
-	columns = append(columns, sourceNames...)
-	columns = append(columns, "winner")
-	return strings.Join(columns, "\t")
+	sequenceWidth := len("sequence_number")
+	delayWidth := delayColumnWidth(sourceNames)
+	winnerWidth := winnerColumnWidth(sourceNames)
+
+	columns := []string{
+		padRight("[block]", len("[block]")),
+		padRight("sequence_number", sequenceWidth),
+	}
+	for _, sourceName := range sourceNames {
+		columns = append(columns, padRight(sourceName, delayWidth))
+	}
+	columns = append(columns, padRight("winner", winnerWidth))
+	return strings.Join(columns, "  ")
+}
+
+func delayColumnWidth(sourceNames []string) int {
+	width := 12
+	for _, sourceName := range sourceNames {
+		if len(sourceName) > width {
+			width = len(sourceName)
+		}
+	}
+	return width
+}
+
+func winnerColumnWidth(sourceNames []string) int {
+	width := len("winner")
+	for _, sourceName := range sourceNames {
+		if len(sourceName) > width {
+			width = len(sourceName)
+		}
+	}
+	return width
+}
+
+func padRight(value string, width int) string {
+	if len(value) >= width {
+		return value
+	}
+	return value + strings.Repeat(" ", width-len(value))
 }
 
 type Tracker struct {
@@ -1256,22 +1315,25 @@ func (t *Tracker) formatBlockLineLocked(record blockRecord) string {
 	if record.SequenceNumber > 0 {
 		sequenceNumber = fmt.Sprintf("%d", record.SequenceNumber)
 	}
-	blockHash := strings.TrimSpace(record.BlockHash)
-	if blockHash == "" {
-		blockHash = record.BlockID
-	}
 
-	columns := []string{"[block]", sequenceNumber, blockHash}
+	sequenceWidth := len("sequence_number")
+	delayWidth := delayColumnWidth(t.sourceNames)
+	winnerWidth := winnerColumnWidth(t.sourceNames)
+
+	columns := []string{
+		padRight("[block]", len("[block]")),
+		padRight(sequenceNumber, sequenceWidth),
+	}
 	for _, sourceName := range t.sourceNames {
 		arrival, ok := record.SeenBy[sourceName]
 		if !ok {
-			columns = append(columns, "NA")
+			columns = append(columns, padRight("NA", delayWidth))
 			continue
 		}
-		columns = append(columns, arrival.Delay.String())
+		columns = append(columns, padRight(arrival.Delay.String(), delayWidth))
 	}
-	columns = append(columns, record.FirstSource)
-	return strings.Join(columns, "\t")
+	columns = append(columns, padRight(record.FirstSource, winnerWidth))
+	return strings.Join(columns, "  ")
 }
 
 func (t *Tracker) pruneLocked(now time.Time) {
@@ -1298,11 +1360,13 @@ func metricsHandler(metricsPath string, tracker *Tracker, registry *prometheus.R
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
-		w.Header().Set("Content-Type", "application/json")
-		encoder := json.NewEncoder(w)
-		encoder.SetIndent("", "  ")
-		if err := encoder.Encode(tracker.SummaryWithPercentiles(time.Now(), incrementalSummaryInterval)); err != nil {
-			log.Printf("[metrics] encode summary failed: %v", err)
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		summary := tracker.SummaryWithPercentiles(time.Now(), incrementalSummaryInterval)
+		for _, line := range summaryLines(summary) {
+			if _, err := fmt.Fprintln(w, line); err != nil {
+				log.Printf("[metrics] write summary failed: %v", err)
+				return
+			}
 		}
 	})
 	mux.Handle("/metrics", promhttp.HandlerFor(registry, promhttp.HandlerOpts{}))
